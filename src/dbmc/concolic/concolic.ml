@@ -5,6 +5,9 @@ open Log.Export
 open Jayil
 open Ast
 
+module SuduZ3 = Solver.SuduZ3
+open SuduZ3
+
 type dvalue =
   | Direct of value
   | FunClosure of Ident.t * function_value * denv
@@ -104,16 +107,19 @@ let create_session ?max_step ?(debug_mode = No_debug) (state : Global_state.t)
   }
 
 
-(*************** Branch Tracking: ***************)
+(**************** Branch Tracking: ****************)
 exception All_Branches_Hit
 exception Unreachable_Branch
 
 (* Branch status types: *)
 type status = Hit | Unhit
 type branch_status = {mutable true_branch: status; mutable false_branch: status}
+type branch = True_branch of ident | False_branch of ident
 
 (* Tracks if a given branch has been hit in our testing yet. *)
 let branches = Ident_hashtbl.create 2 
+
+let target_branch : branch option ref = ref None
 
 let status_to_string status = 
   match status with 
@@ -122,7 +128,7 @@ let status_to_string status =
 
 let print_branch_status x branch_status = 
   let Ident(s) = x in 
-  Printf.printf "%s: True=%s; False=%s" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
+  Format.printf "%s: True=%s; False=%s" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
 
 let print_branches () =
    Ident_hashtbl.iter (fun x s -> print_branch_status x s) branches
@@ -133,11 +139,14 @@ let add_branch (x : ident) : unit =
   ()
 
 (* Marks a branch as hit. *)
-let hit_branch (x : ident) (b : bool) : unit = 
+let hit_branch (x : ident) (b : bool) : bool = 
   let branch_status = Ident_hashtbl.find branches x in 
-  match b with 
-  | true -> branch_status.true_branch <- Hit
-  | false ->  branch_status.false_branch <- Hit
+  match b, branch_status.true_branch, branch_status.false_branch with 
+  | true, Unhit, Unhit -> branch_status.true_branch <- Hit; target_branch := Some(False_branch(x)); true
+  | true, Unhit, _ -> branch_status.true_branch <- Hit; false
+  | false, Unhit, Unhit ->  branch_status.false_branch <- Hit; target_branch := Some(True_branch(x)); true
+  | false, _, Unhit ->  branch_status.false_branch <- Hit; false
+  | _, _, _ -> false
 
 (* Checks if a given branch is hit. *)
 let is_branch_hit (x : ident) (b : bool) : status = 
@@ -163,7 +172,35 @@ and find_branches_in_clause (clause : clause) : unit =
       find_branches e1;
   | _ -> () 
 
-(**************************************)
+(* Checks if all branches have been hit. *)
+let all_branches_hit () = 
+  let folder (x : ident) (status : branch_status) (accum : ident option) = 
+    match status.true_branch, status.false_branch with 
+    | Unhit, Unhit -> Some(x) 
+    | Unhit, Hit -> Some(x) 
+    | Hit, Unhit -> Some(x)
+    | Hit, Hit -> accum
+  in 
+  Ident_hashtbl.fold folder branches None 
+
+(****************************************)
+
+(*************** SMT Solver *************)
+let solver = Z3.Solver.mk_solver SuduZ3.ctx None
+
+let formula_buffer = ref [] 
+
+let add_formula formula = 
+  formula_buffer := formula :: !formula_buffer 
+
+let flush_formula_buffer () = 
+  Z3.Solver.add solver !formula_buffer; 
+  formula_buffer := [];
+  ()
+  
+let first_run = ref true
+let generate_input_feeder branch = fun _ -> 42
+
 
 let cond_fid b = if b then Ident "$tt" else Ident "$ff"
 
@@ -250,6 +287,12 @@ let debug_clause ~session x v stk =
   debug_stack session x stk (v, stk) ;
   ()
 
+let generate_lookup_key x stk = 
+  let rstk : Rstack.t = Rstack.from_concrete stk in 
+  let block : Cfg.block = {id = x; clauses = []; kind = Main} in
+  let key : Lookup_key.t = {x = x; r_stk = rstk; block = block} in 
+  key
+
 (* OB: we cannot enter the same stack twice. *)
 let rec eval_exp ~session stk env e : denv * dvalue =
   ILog.app (fun m -> m "@[-> %a@]\n" Concrete_stack.pp stk) ;
@@ -279,31 +322,50 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
   debug_update_write_node session x stk ;
 
+  let key = generate_lookup_key x stk in 
+
   let (v : dvalue) =
     match cbody with
-    | Value_body (Value_function vf) ->
+    | Value_body ((Value_function vf) as v) ->
         let retv = FunClosure (x, vf, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+        let formula = Riddler.eq_term_v key (Some(v)) in 
+        add_formula formula;
         retv
-    | Value_body (Value_record r) ->
+    | Value_body ((Value_record r) as v) ->
         let retv = RecordClosure (r, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+        let formula = Riddler.eq_term_v key (Some(v)) in 
+        add_formula formula;
         retv
     | Value_body v ->
         let retv = Direct v in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+        let formula = Riddler.eq_term_v key (Some(v)) in 
+        add_formula formula;
         retv
     | Var_body vx ->
         let (Var (v, _)) = vx in
         let ret_val, ret_stk = fetch_val_with_stk ~session ~stk env vx in
+
+        let key2 = generate_lookup_key v ret_stk in 
+        let formula = Riddler.eq key key2 in 
+        add_formula formula;
+
         add_alias (x, stk) (v, ret_stk) session ;
         ret_val
     | Conditional_body (x2, e1, e2) ->
+        let branch_result = fetch_val_to_bool ~session ~stk env x2 in 
+        if hit_branch x branch_result then flush_formula_buffer () else (); 
+
         let e, stk' =
-          if fetch_val_to_bool ~session ~stk env x2
+          if branch_result
           then (e1, Concrete_stack.push (x, cond_fid true) stk)
           else (e2, Concrete_stack.push (x, cond_fid false) stk)
         in
+
+        (* TODO *)
+
         let ret_env, ret_val = eval_exp ~session stk' env e in
         let (Var (ret_id, _) as last_v) = Ast_tools.retv e in
         let _, ret_stk = fetch_val_with_stk ~session ~stk:stk' ret_env last_v in
@@ -314,6 +376,8 @@ and eval_clause ~session stk env clause : denv * dvalue =
         let n = session.input_feeder (x, stk) in
         let retv = Direct (Value_int n) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+        let formula = Riddler.eq_term_v key None in 
+        add_formula formula;
         retv
     | Appl_body (vx1, (Var (x2, _) as vx2)) -> (
         match fetch_val ~session ~stk env vx1 with
@@ -485,12 +549,39 @@ and check_pattern ~session ~stk env vx pattern : bool =
   in
   is_pass
 
-let eval session e =
+(* Random integer generator. *)
+let random_var_gen = Int.gen_incl (-100) 100
+let create_concolic_session input_feeder = 
+  {
+    (make_default_session ()) with 
+    input_feeder = input_feeder
+  }
+
+let default_concolic_session = create_concolic_session (fun _ -> (Quickcheck.random_value ~seed:`Nondeterministic random_var_gen)) 
+
+(* Creates a new session for a concolic execution run. *)
+let generate_new_session () = 
+  match all_branches_hit (), !target_branch with 
+  | None, _ -> raise All_Branches_Hit 
+  | Some(unhit), None -> if !first_run then default_concolic_session else raise Unreachable_Branch
+  | Some(_), Some(target) -> 
+    let new_input_feeder = generate_input_feeder target in 
+    create_concolic_session new_input_feeder
+
+let rec eval e =
+  Format.printf "\nRunning program...\n";
+
+  (* Check if execution is complete by generating a new session: *)
+  let session = generate_new_session () in
+
   let empty_env = Ident_map.empty in
   try
     let v = snd (eval_exp ~session Concrete_stack.empty empty_env e) in
-    raise (Terminate v)
+    (* Print evaluated result and run again. *)
+    Format.printf "Evaluated to: %a\n" pp_dvalue v;
+    eval e
   with
+  (* TODO: Error cases: TODO, if we hit abort, re-run if setting is applied. *)
   | Reach_max_step (x, stk) ->
       Fmt.epr "Reach max steps\n" ;
       (* alert_lookup target_stk x stk session.lookup_alert; *)
@@ -503,3 +594,13 @@ let eval session e =
       Fmt.epr "Run into wrong stack\n" ;
       alert_lookup session x stk ;
       raise (Run_into_wrong_stack (x, stk))
+
+
+(* Concolically evaluate/test program. *)
+let concolic_eval e = 
+  (* Collect branch information from AST: *)
+  find_branches e;
+  print_branches ();
+
+  (* Repeatedly evaluate program: *)
+  eval e
