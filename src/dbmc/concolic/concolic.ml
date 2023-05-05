@@ -103,6 +103,68 @@ let create_session ?max_step ?(debug_mode = No_debug) (state : Global_state.t)
     lookup_alert = state.lookup_alert;
   }
 
+
+(*************** Branch Tracking: ***************)
+exception All_Branches_Hit
+exception Unreachable_Branch
+
+(* Branch status types: *)
+type status = Hit | Unhit
+type branch_status = {mutable true_branch: status; mutable false_branch: status}
+
+(* Tracks if a given branch has been hit in our testing yet. *)
+let branches = Ident_hashtbl.create 2 
+
+let status_to_string status = 
+  match status with 
+  | Hit -> "HIT"
+  | Unhit -> "UNHIT"
+
+let print_branch_status x branch_status = 
+  let Ident(s) = x in 
+  Printf.printf "%s: True=%s; False=%s" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
+
+let print_branches () =
+   Ident_hashtbl.iter (fun x s -> print_branch_status x s) branches
+
+(* Adds a branch to tracking. *)
+let add_branch (x : ident) : unit = 
+  Ident_hashtbl.add branches x {true_branch = Unhit; false_branch = Unhit};
+  ()
+
+(* Marks a branch as hit. *)
+let hit_branch (x : ident) (b : bool) : unit = 
+  let branch_status = Ident_hashtbl.find branches x in 
+  match b with 
+  | true -> branch_status.true_branch <- Hit
+  | false ->  branch_status.false_branch <- Hit
+
+(* Checks if a given branch is hit. *)
+let is_branch_hit (x : ident) (b : bool) : status = 
+  let branch_status = Ident_hashtbl.find branches x in 
+  match b with 
+  | true -> branch_status.true_branch
+  | false -> branch_status.false_branch
+
+(* Find all branches in an expression. *)
+let rec find_branches (e : expr) : unit = 
+  let (Expr clauses) = e in 
+  List.fold clauses ~init:() ~f:(fun () clause -> find_branches_in_clause clause)
+
+(* Find all branches in a clause. *)  
+and find_branches_in_clause (clause : clause) : unit = 
+  let (Clause (Var (x, _), cbody)) = clause in
+  match cbody with 
+  | Conditional_body (x2, e1, e2) -> 
+      add_branch x;
+      find_branches e1;
+      find_branches e2; 
+  | Value_body (Value_function (Function_value (x2, e1))) -> 
+      find_branches e1;
+  | _ -> () 
+
+(**************************************)
+
 let cond_fid b = if b then Ident "$tt" else Ident "$ff"
 
 (* This function will add a directed edge x1 -> x2 in the alias graph. Thus
