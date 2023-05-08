@@ -105,8 +105,7 @@ let create_session ?max_step ?(debug_mode = No_debug) (state : Global_state.t)
     rstk_picked = state.rstk_picked;
     lookup_alert = state.lookup_alert;
   }
-
-
+  
 (**************** Branch Tracking: ****************)
 exception All_Branches_Hit
 exception Unreachable_Branch
@@ -119,7 +118,8 @@ type branch = True_branch of ident | False_branch of ident
 (* Tracks if a given branch has been hit in our testing yet. *)
 let branches = Ident_hashtbl.create 2 
 
-let target_branch : branch option ref = ref None
+let target_branch : Z3.Expr.expr option ref = ref None
+let target_stack = ref Concrete_stack.empty
 
 let status_to_string status = 
   match status with 
@@ -128,7 +128,7 @@ let status_to_string status =
 
 let print_branch_status x branch_status = 
   let Ident(s) = x in 
-  Format.printf "%s: True=%s; False=%s" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
+  Format.printf "%s: True=%s; False=%s\n" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
 
 let print_branches () =
    Ident_hashtbl.iter (fun x s -> print_branch_status x s) branches
@@ -138,15 +138,29 @@ let add_branch (x : ident) : unit =
   Ident_hashtbl.add branches x {true_branch = Unhit; false_branch = Unhit};
   ()
 
-(* Marks a branch as hit. *)
-let hit_branch (x : ident) (b : bool) : bool = 
+let update_target_branch (x : ident) (condition_key : Lookup_key.t) stk (b : bool) : bool = 
+  let formula = Riddler.eqv condition_key (Value_bool (not b)) in
   let branch_status = Ident_hashtbl.find branches x in 
   match b, branch_status.true_branch, branch_status.false_branch with 
-  | true, Unhit, Unhit -> branch_status.true_branch <- Hit; target_branch := Some(False_branch(x)); true
-  | true, Unhit, _ -> branch_status.true_branch <- Hit; false
-  | false, Unhit, Unhit ->  branch_status.false_branch <- Hit; target_branch := Some(True_branch(x)); true
-  | false, _, Unhit ->  branch_status.false_branch <- Hit; false
+  | true, _, Unhit | false, Unhit, _ -> 
+    let Ident(s) = x in 
+    Format.printf "Updating target branch to: %s %b\n" s (not b);
+    target_branch := Some(formula);
+    let call_site = if b then Ident "$tt" else Ident "$ff" in 
+    target_stack := Concrete_stack.push (x, call_site) stk;
+    target_stack := stk;
+    true
   | _, _, _ -> false
+
+(* Marks a branch as hit. *)
+let hit_branch (x : ident) (b : bool) : unit = 
+  let Ident(s) = x in
+  Format.printf "Hitting: %s %b\n" s b;
+  let branch_status = Ident_hashtbl.find branches x in 
+  match b, branch_status.true_branch, branch_status.false_branch with 
+  | true, Unhit, _ -> branch_status.true_branch <- Hit; 
+  | false, _, Unhit ->  branch_status.false_branch <- Hit; 
+  | _, _, _ -> ()
 
 (* Checks if a given branch is hit. *)
 let is_branch_hit (x : ident) (b : bool) : status = 
@@ -183,8 +197,6 @@ let all_branches_hit () =
   in 
   Ident_hashtbl.fold folder branches None 
 
-(****************************************)
-
 (*************** SMT Solver *************)
 let solver = Z3.Solver.mk_solver SuduZ3.ctx None
 
@@ -199,8 +211,31 @@ let flush_formula_buffer () =
   ()
   
 let first_run = ref true
-let generate_input_feeder branch = fun _ -> 42
 
+let print_solver_formulas solver =
+  let assertions = Z3.Solver.get_assertions solver in
+let rec print_formulas formulas =
+  match formulas with
+  | [] -> ()
+  | hd::tl ->
+    Printf.printf "%s\n" (Z3.Expr.to_string hd);
+    print_formulas tl in
+print_formulas assertions
+
+let solve_SMT_branch () = 
+  match !target_branch with 
+  | None -> None 
+  | Some(condition) -> 
+    Z3.Solver.add solver [condition];
+    Format.printf "Solver formulas:\n";
+    print_solver_formulas solver;
+    let model = get_model_exn solver @@ Z3.Solver.check solver [] in 
+    Some(model)
+
+let generate_input_feeder () = 
+  match solve_SMT_branch () with 
+  | None -> raise Unreachable_Branch
+  | Some(model) -> Input_feeder.from_model model !target_stack
 
 let cond_fid b = if b then Ident "$tt" else Ident "$ff"
 
@@ -322,41 +357,46 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
   debug_update_write_node session x stk ;
 
-  let key = generate_lookup_key x stk in 
+  let x_key = generate_lookup_key x stk in 
 
   let (v : dvalue) =
     match cbody with
     | Value_body ((Value_function vf) as v) ->
+        (* x = fun ... ; *)
         let retv = FunClosure (x, vf, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        let formula = Riddler.eq_term_v key (Some(v)) in 
-        add_formula formula;
+        add_formula @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Value_body ((Value_record r) as v) ->
+        (* x = {...} ; *)
         let retv = RecordClosure (r, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        let formula = Riddler.eq_term_v key (Some(v)) in 
-        add_formula formula;
+        add_formula @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Value_body v ->
+        (* x = <bool or int> ; *)
         let retv = Direct v in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        let formula = Riddler.eq_term_v key (Some(v)) in 
-        add_formula formula;
+        add_formula @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Var_body vx ->
-        let (Var (v, _)) = vx in
+        (* x = y ; *)
+        let (Var (y, _)) = vx in
         let ret_val, ret_stk = fetch_val_with_stk ~session ~stk env vx in
-
-        let key2 = generate_lookup_key v ret_stk in 
-        let formula = Riddler.eq key key2 in 
-        add_formula formula;
-
-        add_alias (x, stk) (v, ret_stk) session ;
+        let y_key = generate_lookup_key y ret_stk in 
+        add_formula @@  Riddler.eq x_key y_key;
+        add_alias (x, stk) (y, ret_stk) session ;
         ret_val
     | Conditional_body (x2, e1, e2) ->
+        (* x = if y then e1 else e2 ; *)
         let branch_result = fetch_val_to_bool ~session ~stk env x2 in 
-        if hit_branch x branch_result then flush_formula_buffer () else (); 
+        let _, condition_stk = fetch_val_with_stk ~session ~stk env x2 in
+        let (Var (y, _)) = x2 in
+        let condition_key = generate_lookup_key y condition_stk in 
+        (* Hit branch: *)
+        hit_branch x branch_result;
+        (* Check for new branch target and flush buffer if needed: *)
+        if update_target_branch x condition_key stk branch_result then flush_formula_buffer () else (); 
 
         let e, stk' =
           if branch_result
@@ -364,11 +404,17 @@ and eval_clause ~session stk env clause : denv * dvalue =
           else (e2, Concrete_stack.push (x, cond_fid false) stk)
         in
 
-        (* TODO *)
+        (* Add formula for current branch taken: *)
+        add_formula @@ Riddler.eqv condition_key (Value_bool branch_result);
 
         let ret_env, ret_val = eval_exp ~session stk' env e in
         let (Var (ret_id, _) as last_v) = Ast_tools.retv e in
         let _, ret_stk = fetch_val_with_stk ~session ~stk:stk' ret_env last_v in
+
+        (* Map x to result of 'if' statement: *)
+        let ret_key = generate_lookup_key ret_id ret_stk in 
+        add_formula @@ Riddler.eq x_key ret_key;
+
         add_alias (x, stk) (ret_id, ret_stk) session ;
         ret_val
     | Input_body ->
@@ -376,27 +422,44 @@ and eval_clause ~session stk env clause : denv * dvalue =
         let n = session.input_feeder (x, stk) in
         let retv = Direct (Value_int n) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        let formula = Riddler.eq_term_v key None in 
-        add_formula formula;
+
+        let Ident(s) = x in 
+        Format.printf "Feed %d to %s\n" n s;
+        add_formula @@ Riddler.eq_term_v x_key None;
         retv
     | Appl_body (vx1, (Var (x2, _) as vx2)) -> (
+        (* x = f y ; *)
         match fetch_val ~session ~stk env vx1 with
         | FunClosure (fid, Function_value (Var (arg, _), body), fenv) ->
             let v2, v2_stk = fetch_val_with_stk ~session ~stk env vx2 in
             let stk2 = Concrete_stack.push (x, fid) stk in
             let env2 = Ident_map.add arg (v2, stk) fenv in
             add_alias (arg, stk) (x2, v2_stk) session ;
+
+            (* Enter function: *)
+            let key_f = generate_lookup_key fid stk in 
+            let key_para = generate_lookup_key arg stk2 in 
+            let key_arg = generate_lookup_key x2 v2_stk in
+            add_formula @@ Riddler.same_funenter key_f fid key_para key_arg;
+
             let ret_env, ret_val = eval_exp ~session stk2 env2 body in
             let (Var (ret_id, _) as last_v) = Ast_tools.retv body in
             let _, ret_stk =
               fetch_val_with_stk ~session ~stk:stk2 ret_env last_v
             in
             add_alias (x, stk) (ret_id, ret_stk) session ;
+
+            (* Exit function: *)
+            let key_out = generate_lookup_key ret_id ret_stk in 
+            (* Regen key_f? *)
+            add_formula @@ Riddler.same_funexit key_f fid x_key key_out;
+
             ret_val
         | _ -> failwith "app to a non fun")
     | Match_body (vx, p) ->
         let retv = Direct (Value_bool (check_pattern ~session ~stk env vx p)) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+        (* TODO: SMT tracking *)
         retv
     | Projection_body (v, key) -> (
         match fetch_val ~session ~stk env v with
@@ -404,6 +467,7 @@ and eval_clause ~session stk env clause : denv * dvalue =
             let (Var (proj_x, _) as vv) = Ident_map.find key r in
             let dvv, vv_stk = fetch_val_with_stk ~session ~stk denv vv in
             add_alias (x, stk) (proj_x, vv_stk) session ;
+            (* TODO: SMT tracking *)
             dvv
         | Direct (Value_record (Record_value _record)) ->
             (* let vv = Ident_map.find key record in
@@ -411,6 +475,7 @@ and eval_clause ~session stk env clause : denv * dvalue =
             failwith "project should also have a closure"
         | _ -> failwith "project on a non record")
     | Not_body vx ->
+        (* x = not y ; *)
         let v = fetch_val_to_direct ~session ~stk env vx in
         let bv =
           match v with
@@ -419,8 +484,14 @@ and eval_clause ~session stk env clause : denv * dvalue =
         in
         let retv = Direct bv in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+
+        let (Var (y, _)) = vx in
+        let y_key = generate_lookup_key y stk in 
+        add_formula @@ Riddler.not_ x_key y_key;
+
         retv
     | Binary_operation_body (vx1, op, vx2) ->
+        (* x = y OP z ; *)
         let v1 = fetch_val_to_direct ~session ~stk env vx1
         and v2 = fetch_val_to_direct ~session ~stk env vx2 in
         let v =
@@ -453,6 +524,13 @@ and eval_clause ~session stk env clause : denv * dvalue =
         in
         let retv = Direct v in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
+
+        let (Var (y, _)) = vx1 in
+        let (Var (z, _)) = vx2 in
+        let y_key = generate_lookup_key y stk in 
+        let z_key = generate_lookup_key z stk in 
+        add_formula @@ Riddler.binop x_key op y_key z_key;
+
         retv
         (* | Abort_body ->
              raise @@ Found_abort x
@@ -565,20 +643,33 @@ let generate_new_session () =
   | None, _ -> raise All_Branches_Hit 
   | Some(unhit), None -> if !first_run then default_concolic_session else raise Unreachable_Branch
   | Some(_), Some(target) -> 
-    let new_input_feeder = generate_input_feeder target in 
-    create_concolic_session new_input_feeder
+      let new_input_feeder = generate_input_feeder () in 
+      create_concolic_session new_input_feeder
 
 let rec eval e =
   Format.printf "\nRunning program...\n";
+  print_branches ();
+
+  let target_branch_str = 
+  match !target_branch with 
+  | None -> "None"
+  | Some(branch) -> Z3.Expr.to_string branch 
+  in 
+  Format.printf "Target branch (cond): %s\n" target_branch_str;
 
   (* Check if execution is complete by generating a new session: *)
   let session = generate_new_session () in
+  (* Now, we have a new session; reset tracking variables: *)
+  target_branch := None;
+  Z3.Solver.reset solver;
+  formula_buffer := [];
 
   let empty_env = Ident_map.empty in
   try
     let v = snd (eval_exp ~session Concrete_stack.empty empty_env e) in
     (* Print evaluated result and run again. *)
     Format.printf "Evaluated to: %a\n" pp_dvalue v;
+    first_run := false;
     eval e
   with
   (* TODO: Error cases: TODO, if we hit abort, re-run if setting is applied. *)
@@ -600,7 +691,8 @@ let rec eval e =
 let concolic_eval e = 
   (* Collect branch information from AST: *)
   find_branches e;
-  print_branches ();
+  (* print_branches (); *)
 
+  Format.printf "\n";
   (* Repeatedly evaluate program: *)
   eval e
