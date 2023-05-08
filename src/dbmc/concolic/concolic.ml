@@ -457,9 +457,11 @@ and eval_clause ~session stk env clause : denv * dvalue =
             ret_val
         | _ -> failwith "app to a non fun")
     | Match_body (vx, p) ->
-        let retv = Direct (Value_bool (check_pattern ~session ~stk env vx p)) in
+        let match_res = Value_bool (check_pattern ~session ~stk env vx p) in
+        let retv = Direct (match_res) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
         (* TODO: SMT tracking *)
+        add_formula @@ Riddler.eq_term_v x_key (Some(match_res));
         retv
     | Projection_body (v, key) -> (
         match fetch_val ~session ~stk env v with
@@ -468,6 +470,8 @@ and eval_clause ~session stk env clause : denv * dvalue =
             let dvv, vv_stk = fetch_val_with_stk ~session ~stk denv vv in
             add_alias (x, stk) (proj_x, vv_stk) session ;
             (* TODO: SMT tracking *)
+            let proj_key = generate_lookup_key proj_x vv_stk in 
+            add_formula @@ Riddler.eq x_key proj_key;
             dvv
         | Direct (Value_record (Record_value _record)) ->
             (* let vv = Ident_map.find key record in
@@ -553,32 +557,6 @@ and eval_clause ~session stk env clause : denv * dvalue =
             then raise @@ Found_target { x; stk; v = ab_v }
             else raise @@ Found_abort ab_v
         | With_full_target (target, tar_stk) ->
-            (* DEBUG OUTPUT *)
-            (* let () =
-                 print_endline @@ "target equal: "
-                 ^ string_of_bool (Id.equal target x)
-               in
-               let () =
-                 print_endline @@ "stack equal: "
-                 ^ string_of_bool
-                     (Concrete_stack.equal tar_stk
-                        (Concrete_stack.of_list @@ List.rev
-                       @@ Concrete_stack.to_list @@ stk))
-               in
-               let () = print_endline @@ "-------------" in
-               let () = print_endline @@ "expected id  : " ^ show_ident target in
-               let () = print_endline @@ "actual id : " ^ show_ident x in
-               let () = print_endline @@ "-------------" in
-               let () =
-                 print_endline @@ "expected stack  : "
-                 ^ Concrete_stack.to_string tar_stk
-               in
-               let () =
-                 print_endline @@ "actual stack : " ^ Concrete_stack.to_string
-                 @@ Concrete_stack.of_list @@ List.rev
-                 @@ Concrete_stack.to_list stk
-               in
-               let () = print_endline @@ "-------------" in *)
             if Id.equal target x && Concrete_stack.equal_flip tar_stk stk
             then raise @@ Found_target { x; stk; v = ab_v }
             else raise @@ Found_abort ab_v)

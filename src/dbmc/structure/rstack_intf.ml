@@ -82,6 +82,15 @@ module TT = struct
     in
     Concrete_stack.of_list (loop rstk)
 
+  let from_concrete (cstk : Concrete_stack.t) : t = 
+    let rec loop cstk = 
+      match cstk with 
+      | [] -> empty 
+      | frame :: tail -> (cons Co_pop (loop tail) frame)
+    in 
+    let frame_list = Concrete_stack.to_list cstk in 
+    loop frame_list
+
   let relativize (target_stk : Concrete_stack.t) (call_stk : Concrete_stack.t) :
       t =
     let rec discard_common ts cs =

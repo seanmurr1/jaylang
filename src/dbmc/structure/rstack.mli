@@ -12,3 +12,4 @@ val paired_callsite : t -> Id.t -> Id.t option
 val pop_at_condtop : t -> frame -> bool * t
 val relativize : Concrete_stack.t -> Concrete_stack.t -> t
 val concretize_top : t -> Concrete_stack.t
+val from_concrete : Concrete_stack.t -> t
