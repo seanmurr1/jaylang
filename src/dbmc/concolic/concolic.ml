@@ -36,6 +36,19 @@ and pp_record_c (Record_value r, env) oc =
   (Fmt.braces (Fmt.iter_bindings ~sep:(Fmt.any ", ") Ident_map.iter pp_entry))
     oc r
 
+let rec dvalue_to_string dv = 
+  match dv with 
+  | Direct v -> Jayil.Ast_pp.show_value v 
+  | FunClosure(x, fval, env) -> let Ident(s) = x in "(FC: `"^s^"`, "^(env_to_string env)^")"
+  | _ -> "unsupported"
+and env_to_string env = 
+  let seq = Ident_map.to_seq env in 
+  let f_print (i, (v, stk)) = 
+    let Ident(s) = i in 
+    s ^ "=>" ^ (dvalue_to_string v) ^ "_" ^ (stk |> Rstack.from_concrete |> Rstack.to_string) ^ ", " 
+  in
+  BatSeq.to_string f_print seq;
+
 exception Found_target of { x : Id.t; stk : Concrete_stack.t; v : dvalue }
 exception Found_abort of dvalue
 exception Terminate of dvalue
@@ -118,8 +131,8 @@ type branch = True_branch of ident | False_branch of ident
 (* Tracks if a given branch has been hit in our testing yet. *)
 let branches = Ident_hashtbl.create 2 
 
-let target_branch : Z3.Expr.expr option ref = ref None
-let target_stack = ref Concrete_stack.empty
+let target_branch : (Lookup_key.t * Z3.Expr.expr) option ref = ref None
+(* let target_stack = ref Concrete_stack.empty *)
 
 let status_to_string status = 
   match status with 
@@ -131,6 +144,7 @@ let print_branch_status x branch_status =
   Format.printf "%s: True=%s; False=%s\n" s (status_to_string branch_status.true_branch) (status_to_string branch_status.false_branch)
 
 let print_branches () =
+   Format.printf "\nBranch Information:\n";
    Ident_hashtbl.iter (fun x s -> print_branch_status x s) branches
 
 (* Adds a branch to tracking. *)
@@ -138,21 +152,17 @@ let add_branch (x : ident) : unit =
   Ident_hashtbl.add branches x {true_branch = Unhit; false_branch = Unhit};
   ()
 
-let update_target_branch (x : ident) (condition_key : Lookup_key.t) stk (b : bool) : bool = 
+let update_target_branch (x_key : Lookup_key.t) (condition_key : Lookup_key.t) (b : bool) : unit = 
   let formula = Riddler.eqv condition_key (Value_bool (not b)) in
-  let branch_status = Ident_hashtbl.find branches x in 
+  let branch_status = Ident_hashtbl.find branches x_key.x in 
   match b, branch_status.true_branch, branch_status.false_branch with 
   | true, _, Unhit | false, Unhit, _ -> 
-    let Ident(s) = x in 
-    Format.printf "Updating target branch to: %s %b\n" s (not b);
-    target_branch := Some(formula);
-    let call_site = if b then Ident "$tt" else Ident "$ff" in 
-    target_stack := Concrete_stack.push (x, call_site) stk;
-    target_stack := stk;
-    true
-  | _, _, _ -> false
+    Format.printf "Updating target branch to: %s:%b, with condition %s\n" (Lookup_key.to_string x_key) (not b) (Z3.Expr.to_string formula);
+    target_branch := Some(x_key, formula);
+  | _, _, _ -> ()
 
 (* Marks a branch as hit. *)
+(* TODO: if we hit target, set target to NONE *)
 let hit_branch (x : ident) (b : bool) : unit = 
   let Ident(s) = x in
   Format.printf "Hitting: %s %b\n" s b;
@@ -200,16 +210,97 @@ let all_branches_hit () =
 (*************** SMT Solver *************)
 let solver = Z3.Solver.mk_solver SuduZ3.ctx None
 
-let formula_buffer = ref [] 
+let implication_store = Hashtbl.create (module Lookup_key)
 
-let add_formula formula = 
-  formula_buffer := formula :: !formula_buffer 
+let parent_implications = Hashtbl.create (module Lookup_key)
 
-let flush_formula_buffer () = 
-  Z3.Solver.add solver !formula_buffer; 
-  formula_buffer := [];
+let p_to_s (k, b) =
+  "("^(Lookup_key.to_string k)^":"^(Bool.to_string b)^")"
+
+let l_to_s l = 
+  List.fold l ~init:"" ~f:(fun c p -> c^(p_to_s p))
+
+let print_parents () = 
+  Printf.printf "PARENTS:\n";
+  Hashtbl.iteri parent_implications ~f:(fun ~key ~data -> Printf.printf "%s --> %s\n" (Lookup_key.to_string key) (l_to_s data));
+  Printf.printf "DONE\n";
   ()
-  
+
+let add_implication formula parent = 
+  Printf.printf "IMPLICATION: %s => %s\n" (Lookup_key.to_string parent) (Z3.Expr.to_string formula); 
+  let store = Hashtbl.find implication_store parent in 
+  match store with 
+  | None -> Hashtbl.add_exn implication_store ~key:parent ~data:[formula]
+  | Some(lst) -> Hashtbl.set implication_store ~key:parent ~data:(formula :: lst)
+
+let parse_parents parents = 
+  List.fold parents ~init:([], []) ~f:(fun (exps, parents) (parent, direction) -> 
+    ((Riddler.eqv parent (Value_bool direction)) :: exps, parent :: parents))
+
+let gen_antecedents children = 
+  List.fold children ~init:([], []) ~f:(fun (exps, parents) key -> 
+    match Hashtbl.find parent_implications key with 
+    | None -> (exps, parents)
+    | Some(parent_lst) -> let (new_exps, new_parents) = parse_parents parent_lst in 
+      (new_exps @ exps, new_parents @ parents)
+    ) 
+
+let rec get_dependencies children =
+  List.fold children ~init:[] ~f:(fun deps key ->
+    match Hashtbl.find parent_implications key with 
+    | None -> deps 
+    | Some(lst) -> let (exps, parents) = parse_parents lst in 
+      deps @ exps @ (get_dependencies parents)
+    ) 
+
+(* Create right associative chain of implications. *)
+let rec gen_formula children formula = 
+  match gen_antecedents children with
+  | ([], _) -> formula
+  | (exps, parents) -> 
+    let antecedent = if List.length exps >1 then Riddler.and_ exps else List.hd_exn exps in 
+    let implication = Riddler.(@=>) antecedent formula in 
+    gen_formula parents implication
+
+let add_formula children parent formula = 
+  let new_formula = gen_formula children formula in 
+  match parent with 
+  | None -> (Printf.printf "ADDED: %s\n" (Z3.Expr.to_string new_formula)); Z3.Solver.add solver [new_formula]
+  | Some(parent) -> add_implication new_formula parent
+
+let add_parents child_key condition_key direction ret_key = 
+  match (Hashtbl.find parent_implications child_key), (Hashtbl.find parent_implications condition_key) with 
+  | None, None -> Hashtbl.set parent_implications ~key:child_key ~data:[(condition_key, direction)]
+  | Some(lst), None -> Hashtbl.set parent_implications ~key:child_key ~data:((condition_key, direction) :: lst)
+  | None, Some(lst) -> Hashtbl.set parent_implications ~key:child_key ~data:((condition_key, direction) :: lst)
+  | Some(lst1), Some(lst2) -> Hashtbl.set parent_implications ~key:child_key ~data:((condition_key, direction) :: lst1 @ lst2)
+
+let add_parents2 child_key dependencies = 
+  let cur = match Hashtbl.find parent_implications child_key with 
+  | None -> [] 
+  | Some(lst) -> lst 
+  in
+  List.fold dependencies ~init:cur ~f:(fun c p -> 
+    match Hashtbl.find parent_implications p with 
+    | None -> cur 
+    | Some(lst) -> Hashtbl.set parent_implications ~key:child_key ~data:(lst @ cur); lst @ cur
+    )
+
+
+let flush_implications parent_key condition_key direction = 
+  let antecedent = Riddler.eqv condition_key (Value_bool direction) in
+  let store = Hashtbl.find implication_store condition_key in 
+  match store with 
+  | None -> ()
+  | Some(lst) -> 
+    let consequent = Riddler.and_ lst in
+    let implication = Riddler.(@=>) antecedent consequent in
+    (* add_formula_helper parent_key implication; *)
+    add_formula [condition_key] parent_key implication;
+    Hashtbl.remove implication_store condition_key
+
+(****************************)
+
 let first_run = ref true
 
 let print_solver_formulas solver =
@@ -225,17 +316,16 @@ print_formulas assertions
 let solve_SMT_branch () = 
   match !target_branch with 
   | None -> None 
-  | Some(condition) -> 
+  | Some(key, condition) -> 
     Z3.Solver.add solver [condition];
-    Format.printf "Solver formulas:\n";
-    print_solver_formulas solver;
+    Z3.Solver.add solver [Riddler.picked key];
     let model = get_model_exn solver @@ Z3.Solver.check solver [] in 
     Some(model)
 
 let generate_input_feeder () = 
   match solve_SMT_branch () with 
   | None -> raise Unreachable_Branch
-  | Some(model) -> Input_feeder.from_model model !target_stack
+  | Some(model) -> Input_feeder.from_model2 model 
 
 let cond_fid b = if b then Ident "$tt" else Ident "$ff"
 
@@ -329,7 +419,7 @@ let generate_lookup_key x stk =
   key
 
 (* OB: we cannot enter the same stack twice. *)
-let rec eval_exp ~session stk env e : denv * dvalue =
+let rec eval_exp ~session stk env e parent_key direction : denv * dvalue =
   ILog.app (fun m -> m "@[-> %a@]\n" Concrete_stack.pp stk) ;
   (match session.mode with
   | With_full_target (_, target_stk) ->
@@ -342,12 +432,14 @@ let rec eval_exp ~session stk env e : denv * dvalue =
 
   let (Expr clauses) = e in
   let denv, vs' =
-    List.fold_map ~f:(eval_clause ~session stk) ~init:env clauses
+    List.fold_map ~f:(eval_clause ~session stk parent_key direction) ~init:env clauses
   in
   (denv, List.last_exn vs')
 
 (* OB: once stack is to change, there must be an `eval_exp` *)
-and eval_clause ~session stk env clause : denv * dvalue =
+and eval_clause ~session stk parent_key direction env clause : denv * dvalue =
+  (* print_parents (); *)
+
   let (Clause (Var (x, _), cbody)) = clause in
   (match session.max_step with
   | None -> ()
@@ -365,26 +457,28 @@ and eval_clause ~session stk env clause : denv * dvalue =
         (* x = fun ... ; *)
         let retv = FunClosure (x, vf, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        add_formula @@ Riddler.eq_term_v x_key (Some(v));
+        (* Printf.printf "Adding function closure: %s\n" @@ dvalue_to_string retv; *)
+        add_formula [] parent_key @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Value_body ((Value_record r) as v) ->
         (* x = {...} ; *)
         let retv = RecordClosure (r, env) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        add_formula @@ Riddler.eq_term_v x_key (Some(v));
+        add_formula [] parent_key @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Value_body v ->
         (* x = <bool or int> ; *)
         let retv = Direct v in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        add_formula @@ Riddler.eq_term_v x_key (Some(v));
+        add_formula [] parent_key @@ Riddler.eq_term_v x_key (Some(v));
         retv
     | Var_body vx ->
         (* x = y ; *)
         let (Var (y, _)) = vx in
         let ret_val, ret_stk = fetch_val_with_stk ~session ~stk env vx in
         let y_key = generate_lookup_key y ret_stk in 
-        add_formula @@  Riddler.eq x_key y_key;
+        add_formula [y_key] parent_key @@ Riddler.eq x_key y_key;
+        let _ = add_parents2 x_key [y_key] in 
         add_alias (x, stk) (y, ret_stk) session ;
         ret_val
     | Conditional_body (x2, e1, e2) ->
@@ -395,8 +489,8 @@ and eval_clause ~session stk env clause : denv * dvalue =
         let condition_key = generate_lookup_key y condition_stk in 
         (* Hit branch: *)
         hit_branch x branch_result;
-        (* Check for new branch target and flush buffer if needed: *)
-        if update_target_branch x condition_key stk branch_result then flush_formula_buffer () else (); 
+        (* Check for new branch target: *)
+        update_target_branch x_key condition_key branch_result;
 
         let e, stk' =
           if branch_result
@@ -404,16 +498,28 @@ and eval_clause ~session stk env clause : denv * dvalue =
           else (e2, Concrete_stack.push (x, cond_fid false) stk)
         in
 
-        (* Add formula for current branch taken: *)
-        add_formula @@ Riddler.eqv condition_key (Value_bool branch_result);
-
-        let ret_env, ret_val = eval_exp ~session stk' env e in
+        (* Evalutate branch with new parent condition: *)
+        let ret_env, ret_val = eval_exp ~session stk' env e (Some(condition_key)) (Some(branch_result))in
         let (Var (ret_id, _) as last_v) = Ast_tools.retv e in
         let _, ret_stk = fetch_val_with_stk ~session ~stk:stk' ret_env last_v in
 
         (* Map x to result of 'if' statement: *)
         let ret_key = generate_lookup_key ret_id ret_stk in 
-        add_formula @@ Riddler.eq x_key ret_key;
+
+        (* add_formula @@ Riddler.eq x_key ret_key; *) (* TODO FIX BELOW? *)
+        add_formula [ret_key] (Some(condition_key)) @@ Riddler.eq x_key ret_key;
+        flush_implications parent_key condition_key branch_result;
+        (* Add parent relationship to return variable: *)
+        add_parents x_key condition_key branch_result ret_key;
+
+        (* TODO: add Pick x_key => parents? *)
+        let dependencies = match parent_key, direction with 
+        | Some(key), Some(d) -> Riddler.eqv key (Value_bool d) :: get_dependencies [key]
+        | _, _ -> []
+        in
+        let pick_formula = Riddler.(@=>) (Riddler.picked x_key) (Riddler.and_ dependencies) in
+        Printf.printf "Pick formula: %s\n" (Z3.Expr.to_string pick_formula);
+        Z3.Solver.add solver [pick_formula];
 
         add_alias (x, stk) (ret_id, ret_stk) session ;
         ret_val
@@ -425,7 +531,7 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
         let Ident(s) = x in 
         Format.printf "Feed %d to %s\n" n s;
-        add_formula @@ Riddler.eq_term_v x_key None;
+        add_formula [] parent_key @@ Riddler.eq_term_v x_key None;
         retv
     | Appl_body (vx1, (Var (x2, _) as vx2)) -> (
         (* x = f y ; *)
@@ -437,12 +543,14 @@ and eval_clause ~session stk env clause : denv * dvalue =
             add_alias (arg, stk) (x2, v2_stk) session ;
 
             (* Enter function: *)
-            let key_f = generate_lookup_key fid stk in 
-            let key_para = generate_lookup_key arg stk2 in 
-            let key_arg = generate_lookup_key x2 v2_stk in
-            add_formula @@ Riddler.same_funenter key_f fid key_para key_arg;
+            let Var(xid, _) = vx1 in 
+            let _, f_stk = fetch_val_with_stk ~session ~stk env vx1 in 
+            let key_f = generate_lookup_key xid f_stk in 
+            let key_para = generate_lookup_key arg stk in 
+            let key_arg = generate_lookup_key x2 v2_stk in 
+            add_formula [key_f; key_arg] parent_key @@ Riddler.same_funenter key_f fid key_para key_arg;
 
-            let ret_env, ret_val = eval_exp ~session stk2 env2 body in
+            let ret_env, ret_val = eval_exp ~session stk2 env2 body parent_key direction in
             let (Var (ret_id, _) as last_v) = Ast_tools.retv body in
             let _, ret_stk =
               fetch_val_with_stk ~session ~stk:stk2 ret_env last_v
@@ -451,8 +559,10 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
             (* Exit function: *)
             let key_out = generate_lookup_key ret_id ret_stk in 
-            (* Regen key_f? *)
-            add_formula @@ Riddler.same_funexit key_f fid x_key key_out;
+            (* TODO FIX*)
+            add_formula [key_out; key_f; key_arg] parent_key @@ Riddler.same_funexit key_f fid x_key key_out;
+            (* TODO: need to add parent relationship based on key_out *)
+            let _ = add_parents2 x_key [key_out; key_f; key_arg] in
 
             ret_val
         | _ -> failwith "app to a non fun")
@@ -460,8 +570,8 @@ and eval_clause ~session stk env clause : denv * dvalue =
         let match_res = Value_bool (check_pattern ~session ~stk env vx p) in
         let retv = Direct (match_res) in
         let () = add_val_def_mapping (x, stk) (cbody, retv) session in
-        (* TODO: SMT tracking *)
-        add_formula @@ Riddler.eq_term_v x_key (Some(match_res));
+        (* TODO: SMT tracking fix with riddler stuff TODO: check if [] should be empty or smoething with vx...*)
+        add_formula [] parent_key @@ Riddler.eq_term_v x_key (Some(match_res));
         retv
     | Projection_body (v, key) -> (
         match fetch_val ~session ~stk env v with
@@ -469,9 +579,9 @@ and eval_clause ~session stk env clause : denv * dvalue =
             let (Var (proj_x, _) as vv) = Ident_map.find key r in
             let dvv, vv_stk = fetch_val_with_stk ~session ~stk denv vv in
             add_alias (x, stk) (proj_x, vv_stk) session ;
-            (* TODO: SMT tracking *)
+            (* TODO: SMT tracking fix with riddler stuff *)
             let proj_key = generate_lookup_key proj_x vv_stk in 
-            add_formula @@ Riddler.eq x_key proj_key;
+            add_formula [proj_key] parent_key @@ Riddler.eq x_key proj_key;
             dvv
         | Direct (Value_record (Record_value _record)) ->
             (* let vv = Ident_map.find key record in
@@ -491,7 +601,8 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
         let (Var (y, _)) = vx in
         let y_key = generate_lookup_key y stk in 
-        add_formula @@ Riddler.not_ x_key y_key;
+        add_formula [y_key] parent_key @@ Riddler.not_ x_key y_key;
+        let _ = add_parents2 x_key [y_key] in
 
         retv
     | Binary_operation_body (vx1, op, vx2) ->
@@ -531,9 +642,12 @@ and eval_clause ~session stk env clause : denv * dvalue =
 
         let (Var (y, _)) = vx1 in
         let (Var (z, _)) = vx2 in
-        let y_key = generate_lookup_key y stk in 
-        let z_key = generate_lookup_key z stk in 
-        add_formula @@ Riddler.binop x_key op y_key z_key;
+        let _, stk1 = fetch_val_with_stk ~session ~stk env vx1 in 
+        let _, stk2 = fetch_val_with_stk ~session ~stk env vx2 in 
+        let y_key = generate_lookup_key y stk1 in 
+        let z_key = generate_lookup_key z stk2 in 
+        add_formula [y_key; z_key] parent_key @@ Riddler.binop x_key op y_key z_key;
+        let _ = add_parents2 x_key [y_key; z_key] in 
 
         retv
         (* | Abort_body ->
@@ -606,7 +720,9 @@ and check_pattern ~session ~stk env vx pattern : bool =
   is_pass
 
 (* Random integer generator. *)
-let random_var_gen = Int.gen_incl (-100) 100
+(* let random_var_gen = Int.gen_incl (-100) 100 *)
+
+let random_var_gen = Int.gen_incl (-2) 2
 let create_concolic_session input_feeder = 
   {
     (make_default_session ()) with 
@@ -620,31 +736,35 @@ let generate_new_session () =
   match all_branches_hit (), !target_branch with 
   | None, _ -> raise All_Branches_Hit 
   | Some(unhit), None -> if !first_run then default_concolic_session else raise Unreachable_Branch
-  | Some(_), Some(target) -> 
+  | Some(_), Some(_) -> 
       let new_input_feeder = generate_input_feeder () in 
       create_concolic_session new_input_feeder
 
 let rec eval e =
-  Format.printf "\nRunning program...\n";
+  Format.printf "------------------------------\n";
+  Format.printf "Running program...\n";
   print_branches ();
 
   let target_branch_str = 
   match !target_branch with 
   | None -> "None"
-  | Some(branch) -> Z3.Expr.to_string branch 
+  | Some(key, condition) -> (Lookup_key.to_string key)^":"^(Z3.Expr.to_string condition)
   in 
-  Format.printf "Target branch (cond): %s\n" target_branch_str;
+  Format.printf "\nTarget branch (cond): %s\n" target_branch_str;
 
   (* Check if execution is complete by generating a new session: *)
   let session = generate_new_session () in
+  
   (* Now, we have a new session; reset tracking variables: *)
   target_branch := None;
   Z3.Solver.reset solver;
-  formula_buffer := [];
+  Hashtbl.clear implication_store;
+  Hashtbl.clear parent_implications;
 
+  (* Create new environment and evaluate program: *)
   let empty_env = Ident_map.empty in
   try
-    let v = snd (eval_exp ~session Concrete_stack.empty empty_env e) in
+    let v = snd (eval_exp ~session Concrete_stack.empty empty_env e None None) in
     (* Print evaluated result and run again. *)
     Format.printf "Evaluated to: %a\n" pp_dvalue v;
     first_run := false;
@@ -665,12 +785,12 @@ let rec eval e =
       raise (Run_into_wrong_stack (x, stk))
 
 
-(* Concolically evaluate/test program. *)
+(* Concolically execute/test program. *)
 let concolic_eval e = 
   (* Collect branch information from AST: *)
   find_branches e;
-  (* print_branches (); *)
 
-  Format.printf "\n";
+  Format.printf "\nStarting concolic execution...\n";
+
   (* Repeatedly evaluate program: *)
   eval e
