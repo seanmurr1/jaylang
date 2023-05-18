@@ -526,14 +526,14 @@ and eval_clause ~session stk parent env clause : denv * dvalue =
         | FunClosure (fid, Function_value (Var (arg, _), body), fenv) ->
             let v2, v2_stk = fetch_val_with_stk ~session ~stk env vx2 in
             let stk2 = Concrete_stack.push (x, fid) stk in
-            let env2 = Ident_map.add arg (v2, stk) fenv in
+            let env2 = Ident_map.add arg (v2, stk2) fenv in
             add_alias (arg, stk) (x2, v2_stk) session ;
 
             (* Enter function: *)
             let Var(xid, _) = vx1 in 
             let _, f_stk = fetch_val_with_stk ~session ~stk env vx1 in 
             let key_f = generate_lookup_key xid f_stk in 
-            let key_para = generate_lookup_key arg stk in 
+            let key_para = generate_lookup_key arg stk2 in 
             let key_arg = generate_lookup_key x2 v2_stk in 
             (* add_formula [key_f; key_arg] parent @@ Riddler.same_funenter key_f fid key_para key_arg; *)
             add_formula [key_f; key_arg] parent @@ Riddler.enter_fun key_para key_arg;
