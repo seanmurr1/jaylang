@@ -122,6 +122,7 @@ let branch_to_str b =
 exception All_Branches_Hit
 exception Unreachable_Branch of branch
 exception Unsatisfiable_Branch of branch
+exception Missed_Target_Branch
 
 (* Tracks if a given branch has been hit in our testing yet. *)
 let branches = Ident_hashtbl.create 2 
@@ -154,7 +155,6 @@ let update_target_branch branch_key condition_key direction =
   target_branch := Some(branch_key, condition_key, direction)
 
 (* Marks a branch as hit. Updates target branch if needed: *)
-(* TODO: if we hit target, set target to NONE???*)
 let hit_branch branch_key condition_key direction = 
   Format.printf "Hitting: %s: %b\n" (Lookup_key.to_string branch_key) direction;
   let branch_status = Ident_hashtbl.find branches branch_key.x in 
@@ -183,6 +183,19 @@ and find_branches_in_clause (clause : clause) : unit =
   | Value_body (Value_function (Function_value (x2, e1))) -> 
       find_branches e1;
   | _ -> () 
+
+let assert_target_hit (current_target : (Lookup_key.t * Lookup_key.t * bool) option) = 
+  match current_target with 
+  | None -> ()
+  | Some(branch, condition, direction) ->
+    let branch_status = Ident_hashtbl.find branches branch.x in 
+    let result = match direction with 
+    | true -> branch_status.true_branch
+    | false -> branch_status.false_branch 
+    in
+    match result with 
+    | Hit -> () 
+    | Unhit -> raise Missed_Target_Branch  
 
 (* Checks if all branches have been hit. Returns an unhit branch or None. *)
 let all_branches_hit () = 
@@ -552,8 +565,7 @@ and eval_clause ~session stk parent env clause : denv * dvalue =
         let match_key = generate_lookup_key y stk in
         let x_exp = Riddler.key_to_var x_key in
         let pat_exp = Riddler.is_pattern match_key p in
-        Format.printf "Pat exp: %s\n" @@ Z3.Expr.to_string pat_exp;
-        add_formula [match_key] parent @@ SuduZ3.eq x_exp pat_exp;
+        add_formula [match_key] parent @@ (Riddler.and_ [SuduZ3.ifBool x_exp; SuduZ3.eq (SuduZ3.project_bool x_exp) pat_exp]);
         let _ = add_parents2_ x_key [match_key] in
         retv
     | Projection_body (v, key) -> (
@@ -745,6 +757,9 @@ let rec eval e =
   session.step := 0;
   Hashtbl.clear session.val_def_map;
 
+  (* Store target branch and check that is has been hit after this run: *)
+  let current_target = !target_branch in
+
   (* Now, we have a new session; reset tracking variables: *)
   reset_tracking_vars ();
 
@@ -752,6 +767,8 @@ let rec eval e =
   let empty_env = Ident_map.empty in
   try
     let v = snd (eval_exp ~session Concrete_stack.empty empty_env e None) in
+    (* Assert that we hit our target branch: *)
+    assert_target_hit current_target;
     (* Print evaluated result and run again. *)
     Format.printf "Evaluated to: %a\n" pp_dvalue v;
     first_run := false;
