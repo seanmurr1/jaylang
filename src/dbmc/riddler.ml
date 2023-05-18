@@ -174,6 +174,12 @@ let fun_enter_nonlocal key key_f key_fv fid key_arg =
       picked key_arg;
     ]
 
+let enter_fun key_para key_arg = 
+  (eq key_para key_arg)
+
+let exit_fun key_in key_out = 
+  (eq key_in key_out)
+
 let same_funenter key_f fid key_para key_arg =
   and2 (eq_fid key_f fid) (eq key_para key_arg)
 

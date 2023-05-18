@@ -49,3 +49,30 @@ make dj
 make dbmc
 make sato
 ```
+
+Concolic Tester
+================
+
+(Last updated: May 18th, 2023)
+
+The concolic tester is an expansion upon the base JIL interpreter. Its main files are found in `/src/dbmc/concolic/`. The tester uses the Z3 OCaml module for constraint solving.
+
+Related files:
+---
+- `/src/dbmc/concolic/concolic.ml`: concolic tester/interpreter.
+- `/src/dbmc/concolic/concolic_feeder.ml`: logic to obtain an input feeder from a solved Z3 model.
+- `/src-vendor/sudu/z3_api.ml`: wrapper module of base Z3, allowing for compatibility of untyped JIL variables.
+- `/src/dbmc/riddler.ml`: helper functions to generate Z3 formulae given JIL variables.
+- `/src/bin/jil.ml`: driver program to run normal interpreter or concolic tester.
+
+Running the Concolic Tester
+---
+Normal execution of interpreter:
+```
+dune exec src/bin/jil.exe -- -i <path to .jil file> -m normal <input feeder specification>
+```
+
+Concolic execution:
+```
+dune exec src/bin/jil.exe -- -i <path to .jil file> -m concolic
+```

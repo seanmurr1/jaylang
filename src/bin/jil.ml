@@ -23,34 +23,29 @@ let run_program source =
   | Interpreter.Terminate v -> Format.printf "%a" Interpreter.pp_dvalue v
   | ex -> raise ex
 
-(*****ADDITIONS BELOW******)
 
-(* Variable generator (only random integers for now) *)
-(* let var_gen = Int.quickcheck_generator *)
-let limited_var_gen = Int.gen_incl (-100) 100
-
-let test_program_concolic source = 
+(* Run concolic tester: *)
+let rec test_program_concolic source counter =
+  if counter <= 0 then Format.printf "Timeout limit reached. Program will not terminate...\n" else 
+  
   let program = Dj_common.File_utils.read_source source in 
-  let session = 
-    {
-      (Interpreter.make_default_session ()) with 
-      input_feeder = fun _ -> (Quickcheck.random_value ~seed:`Nondeterministic limited_var_gen)
-    }
-  in 
-  (* try Interpreter.test_concolically session program with *)
   try Concolic.concolic_eval program with
-  | Interpreter.Terminate v -> Format.printf "%a" Interpreter.pp_dvalue v 
   | Concolic.All_Branches_Hit -> Format.printf "All branches hit.\n"
+  | Concolic.Unreachable_Branch(b) -> Format.printf "Unreachable branch: %s\n" (Concolic.branch_to_str b)
+  | Concolic.Unsatisfiable_Branch(b) -> Format.printf "Unsatisfiable branch: %s\n" (Concolic.branch_to_str b)
+  | Concolic.Reach_max_step(_, _) -> Format.printf "Reach max step... re-evaluating:\n"; test_program_concolic source (counter - 1)
   | ex -> raise ex 
 
 let speclist = 
   [("-i", Arg.Set_string source_file, "Input source file");
    ("-m", Arg.Set_string mode, "Interpreter mode")]
 
+let reset_limit = 20
+
 let () = 
   Arg.parse speclist anon_fun usage_msg;
   match !mode with 
-  | "concolic" -> test_program_concolic !source_file
+  | "concolic" -> test_program_concolic !source_file reset_limit
   | "normal" -> run_program !source_file
   | _ -> ()
 
