@@ -65,7 +65,7 @@ Related files:
 - `/src/dbmc/riddler.ml`: helper functions to generate Z3 formulae given JIL variables.
 - `/src/bin/jil.ml`: driver program to run normal interpreter or concolic tester.
 
-Running the Concolic Tester
+Running the Concolic Tester:
 ---
 Normal execution of interpreter:
 ```
@@ -76,3 +76,8 @@ Concolic execution:
 ```
 dune exec src/bin/jil.exe -- -i <path to .jil file> -m concolic
 ```
+
+TODO:
+---
+- @Earl: implement "bubbling" up of abort exceptions when found.
+- Model input dependency relations; optimize code.
